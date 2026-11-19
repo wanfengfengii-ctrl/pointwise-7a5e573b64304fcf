@@ -1,0 +1,23 @@
+{
+  "camera_id": "line-cam",
+  "config": {"capacity": 2, "width": 1, "height": 1, "threshold": [1, 2]},
+  "events": [
+    {"op": "frame", "sequence": 10, "pixels": [6], "reject": true},
+    {"op": "reference", "kind": "dark", "sequence": 1, "pixels": [0]},
+    {"op": "reference", "kind": "bright", "sequence": 2, "pixels": [10]},
+    {"op": "reference", "kind": "dark", "sequence": 3, "pixels": [5]},
+    {"op": "frame", "sequence": 10, "pixels": [6]},
+    {"op": "reference", "kind": "bright", "sequence": 4, "pixels": [5], "reject": true},
+    {"op": "reference", "kind": "bright", "sequence": 4, "pixels": [15]},
+    {"op": "frame", "sequence": 20, "pixels": [6]},
+    {"op": "reference", "kind": "bright", "sequence": 5, "pixels": [8]},
+    {"op": "reference", "kind": "dark", "sequence": 6, "pixels": [2]},
+    {"op": "reference", "kind": "dark", "sequence": 7, "pixels": [5]},
+    {"op": "reference", "kind": "bright", "sequence": 8, "pixels": [15]},
+    {"op": "frame", "sequence": 30, "pixels": [6]}
+  ],
+  "checkpoints": [
+    {"after_events": 12, "frames": [[10, 1, 2], [20, 3, 4]], "values": [2, [7, 10], 1]},
+    {"after_events": 13, "frames": [[20, 3, 4], [30, 7, 8]], "values": [2, [1, 5], 0]}
+  ]
+}
