@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from station.runs.bindings import CameraBindings
-from station.runs.config import RunConfig, make_run_config
+from station.runs.config import CalibratedRunConfig, RunConfig, make_calibrated_config, make_run_config
 from station.runs.lifecycle import RunLifecycle
 
 
@@ -11,7 +11,7 @@ from station.runs.lifecycle import RunLifecycle
 class Run:
     run_id: str
     camera_id: str
-    config: RunConfig
+    config: RunConfig | CalibratedRunConfig
     lifecycle: RunLifecycle
 
 
@@ -25,10 +25,7 @@ class RunRegistry:
         if self._closed:
             raise RuntimeError('run registry is closed')
 
-    def open_run(self, camera_id: str, capacity: int, width: int, height: int, threshold: int) -> Run:
-        self._require_open()
-        self._bindings.require_registered(camera_id)
-        config = make_run_config(capacity, width, height, threshold)
+    def _register(self, camera_id: str, config: RunConfig | CalibratedRunConfig) -> Run:
         run_id = uuid4().hex
         while run_id in self._runs:
             run_id = uuid4().hex
@@ -36,6 +33,20 @@ class RunRegistry:
         self._bindings.claim(camera_id, run_id)
         self._runs[run_id] = run
         return run
+
+    def open_run(self, camera_id: str, capacity: int, width: int, height: int, threshold: int) -> Run:
+        self._require_open()
+        self._bindings.require_registered(camera_id)
+        config = make_run_config(capacity, width, height, threshold)
+        return self._register(camera_id, config)
+
+    def open_calibrated_run(
+        self, camera_id: str, capacity: int, width: int, height: int, threshold
+    ) -> Run:
+        self._require_open()
+        self._bindings.require_registered(camera_id)
+        config = make_calibrated_config(capacity, width, height, threshold)
+        return self._register(camera_id, config)
 
     def get_run(self, run_id: str) -> Run:
         self._require_open()

@@ -3,11 +3,26 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from os import PathLike
 
-from station.archive.manifest import ArchiveHeader, ArchiveIntegrityError, ArchivedFrame
-from station.archive.schema import decode_exact_integer, encode_exact_integer, initialize_archive
+from station.archive.manifest import (
+    ArchiveHeader,
+    ArchiveIntegrityError,
+    ArchivedFrame,
+    CalibratedFrame,
+    CalibratedHeader,
+    CalibratedReference,
+)
+from station.archive.schema import (
+    decode_exact_integer,
+    decode_exact_rational,
+    decode_reference_id,
+    encode_exact_integer,
+    encode_exact_rational,
+    encode_reference_id,
+    initialize_archive,
+)
 from station.handover.tickets import HandoverLink
 from station.quality.window import WindowValues
-from station.runs.config import make_run_config
+from station.runs.config import make_calibrated_config, make_run_config
 from station.runs.lifecycle import PausePoint
 
 
@@ -76,6 +91,19 @@ class ArchiveStore:
         self._require_idle()
         return self._find_result(cutoff)
 
+    def _find_calibrated(self, cutoff: PausePoint) -> str | None:
+        if cutoff.high_water is None:
+            return None
+        row = self._connection.execute(
+            'SELECT result_id FROM calibrated_results WHERE run_id = ? AND high_water = ?',
+            (cutoff.run_id, encode_exact_integer(cutoff.high_water)),
+        ).fetchone()
+        return None if row is None else row['result_id']
+
+    def find_calibrated_result(self, cutoff: PausePoint) -> str | None:
+        self._require_idle()
+        return self._find_calibrated(cutoff)
+
     def _insert_header(self, header: ArchiveHeader, high_water: str) -> None:
         config = header.config
         values = header.values
@@ -117,6 +145,77 @@ class ArchiveStore:
 
             self._connection.execute(
                 'INSERT INTO handover_links (run_id, high_water, result_id) VALUES (?, ?, ?)',
+                (cutoff.run_id, high_water, header.result_id),
+            )
+            if self._before_commit is not None:
+                self._before_commit(header.result_id)
+        return header.result_id
+
+    def _insert_calibrated_header(self, header: CalibratedHeader, high_water: str) -> None:
+        config = header.config
+        count, total, over_limit = header.values
+        threshold_num, threshold_den = encode_exact_rational(config.threshold)
+        total_num, total_den = encode_exact_rational(total)
+        self._connection.execute(
+            '''INSERT INTO calibrated_results (
+                   result_id, run_id, high_water, camera_id, capacity, width, height,
+                   threshold_num, threshold_den, frame_count, total_num, total_den, over_limit_count
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (
+                header.result_id, header.cutoff.run_id, high_water, header.camera_id,
+                encode_exact_integer(config.capacity), encode_exact_integer(config.width),
+                encode_exact_integer(config.height), threshold_num, threshold_den,
+                encode_exact_integer(count), total_num, total_den,
+                encode_exact_integer(over_limit),
+            ),
+        )
+
+    def commit_calibrated(
+        self,
+        header: CalibratedHeader,
+        frames: tuple[CalibratedFrame, ...],
+        references: tuple[CalibratedReference, ...],
+    ) -> str:
+        """Publish frames, per-frame bindings, references, and the handover link at once."""
+        cutoff = header.cutoff
+        if cutoff.high_water is None or not frames or len(frames) != header.values[0]:
+            raise ValueError('publication requires a complete nonempty paused window')
+        high_water = encode_exact_integer(cutoff.high_water)
+        with self._transaction(write=True):
+            existing = self._find_calibrated(cutoff)
+            if existing is not None:
+                return existing
+
+            self._insert_calibrated_header(header, high_water)
+            for frame in frames:
+                self._connection.execute(
+                    '''INSERT INTO calibrated_frames (
+                           result_id, position, source_sequence, original_bytes, reference_id, digest
+                       ) VALUES (?, ?, ?, ?, ?, ?)''',
+                    (
+                        header.result_id, frame.position, encode_exact_integer(frame.sequence),
+                        frame.data, encode_reference_id(frame.reference_id), frame.digest,
+                    ),
+                )
+                if self._after_frame is not None:
+                    self._after_frame(header.result_id, frame.position)
+
+            for reference in references:
+                self._connection.execute(
+                    '''INSERT INTO calibrated_references (
+                           result_id, reference_id, dark_sequence, dark_bytes,
+                           bright_sequence, bright_bytes, digest
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    (
+                        header.result_id, encode_reference_id(reference.reference_id),
+                        encode_exact_integer(reference.dark_sequence), reference.dark_data,
+                        encode_exact_integer(reference.bright_sequence), reference.bright_data,
+                        reference.digest,
+                    ),
+                )
+
+            self._connection.execute(
+                'INSERT INTO calibrated_links (run_id, high_water, result_id) VALUES (?, ?, ?)',
                 (cutoff.run_id, high_water, header.result_id),
             )
             if self._before_commit is not None:
@@ -167,6 +266,82 @@ class ArchiveStore:
                 raise ArchiveIntegrityError('invalid archived header or source sequence') from exc
         return header, frames
 
+    @staticmethod
+    def _decode_calibrated_header(row: sqlite3.Row) -> CalibratedHeader:
+        camera_id = row['camera_id']
+        if type(camera_id) is not str or not camera_id:
+            raise ValueError('invalid archived camera ID')
+        cutoff = PausePoint(row['run_id'], decode_exact_integer(row['high_water']))
+        config = make_calibrated_config(
+            decode_exact_integer(row['capacity']),
+            decode_exact_integer(row['width']),
+            decode_exact_integer(row['height']),
+            decode_exact_rational(row['threshold_num'], row['threshold_den']),
+        )
+        values = (
+            decode_exact_integer(row['frame_count']),
+            decode_exact_rational(row['total_num'], row['total_den']),
+            decode_exact_integer(row['over_limit_count']),
+        )
+        return CalibratedHeader(row['result_id'], cutoff, camera_id, config, values)
+
+    def load_calibrated(
+        self, result_id: str
+    ) -> tuple[CalibratedHeader, tuple[CalibratedFrame, ...], tuple[CalibratedReference, ...]] | None:
+        """Load one calibrated result; return None for a grayscale (V1) result ID."""
+        if type(result_id) is not str:
+            raise KeyError(result_id)
+        with self._transaction(write=False):
+            row = self._connection.execute(
+                'SELECT * FROM calibrated_results WHERE result_id = ?', (result_id,)
+            ).fetchone()
+            if row is None:
+                stopped = self._connection.execute(
+                    'SELECT 1 FROM stopped_results WHERE result_id = ?', (result_id,)
+                ).fetchone()
+                if stopped is not None:
+                    return None
+                raise KeyError(result_id)
+            frame_rows = self._connection.execute(
+                '''SELECT position, source_sequence, original_bytes, reference_id, digest
+                   FROM calibrated_frames WHERE result_id = ? ORDER BY position''',
+                (result_id,),
+            )
+            reference_rows = self._connection.execute(
+                '''SELECT reference_id, dark_sequence, dark_bytes, bright_sequence, bright_bytes, digest
+                   FROM calibrated_references WHERE result_id = ?''',
+                (result_id,),
+            )
+            try:
+                header = self._decode_calibrated_header(row)
+                frames = tuple(
+                    CalibratedFrame(
+                        frame['position'],
+                        decode_exact_integer(frame['source_sequence']),
+                        frame['original_bytes'],
+                        decode_reference_id(frame['reference_id']),
+                        frame['digest'],
+                    )
+                    for frame in frame_rows
+                )
+                references = tuple(sorted(
+                    (
+                        CalibratedReference(
+                            decode_reference_id(reference['reference_id']),
+                            decode_exact_integer(reference['dark_sequence']),
+                            reference['dark_bytes'],
+                            decode_exact_integer(reference['bright_sequence']),
+                            reference['bright_bytes'],
+                            reference['digest'],
+                        )
+                        for reference in reference_rows
+                    ),
+                    key=lambda reference: reference.reference_id,
+                ))
+            except ValueError as exc:
+                raise ArchiveIntegrityError('invalid archived calibrated header or evidence') from exc
+        return header, frames, references
+
     def read_handover_link(self, run_id: str) -> HandoverLink | None:
         self._require_idle()
         if type(run_id) is not str:
@@ -174,6 +349,10 @@ class ArchiveStore:
         row = self._connection.execute(
             'SELECT result_id, high_water FROM handover_links WHERE run_id = ?', (run_id,)
         ).fetchone()
+        if row is None:
+            row = self._connection.execute(
+                'SELECT result_id, high_water FROM calibrated_links WHERE run_id = ?', (run_id,)
+            ).fetchone()
         if row is None:
             return None
         try:

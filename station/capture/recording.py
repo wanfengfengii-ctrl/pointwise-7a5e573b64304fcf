@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 
-from station.capture.frames import validate_frame
+from station.capture.calibration import CalibrationLedger, ReferenceGroup
+from station.capture.frames import CapturedFrame, validate_frame
 from station.capture.pages import PageStore
 from station.capture.ring import FrameRing, SlotRef
+from station.runs.config import is_calibrated_config
 from station.runs.registry import RunRegistry
 
 
@@ -16,6 +18,7 @@ class CaptureRecorder:
     def __init__(self, registry: RunRegistry) -> None:
         self._registry = registry
         self._rings: dict[str, FrameRing] = {}
+        self._calibrations: dict[str, CalibrationLedger] = {}
         self._closed = False
 
     def _require_open(self) -> None:
@@ -27,17 +30,58 @@ class CaptureRecorder:
         self._registry.get_run(run_id)
         return self._rings.get(run_id)
 
+    def submit_reference(self, run_id: str, kind: str, sequence: int, data: bytes) -> None:
+        self._require_open()
+        run = self._registry.get_run(run_id)
+        if not is_calibrated_config(run.config):
+            raise ValueError('references require a calibrated run')
+        run.lifecycle.require_running()
+        ledger = self._calibrations.get(run_id)
+        if ledger is None:
+            ledger = CalibrationLedger()
+            self._calibrations[run_id] = ledger
+        ledger.submit(kind, sequence, data, run.config.frame_length)
+
     def append_frame(self, run_id: str, sequence: int, data: bytes) -> WriteReceipt:
         self._require_open()
         run = self._registry.get_run(run_id)
         run.lifecycle.require_running()
         frame = validate_frame(sequence, data, run.config.frame_length)
+        ledger = self._calibrations.get(run_id)
+        if is_calibrated_config(run.config) and (ledger is None or ledger.current_group is None):
+            raise ValueError('no reference group is in effect yet')
         ring = self._rings.get(run_id)
         if ring is None:
             ring = FrameRing(run.config.capacity, PageStore(run.config.frame_length))
         ref = ring.append(frame)
         self._rings[run_id] = ring
+        if ledger is not None:
+            ledger.record_frame(frame.sequence, tuple(slot.sequence for slot in ring.iter_slot_refs()))
         return WriteReceipt(ref.slot, ref.sequence)
+
+    def calibrated_window(self, run_id: str) -> tuple[tuple[CapturedFrame, ReferenceGroup], ...]:
+        """Live frames of one calibrated run paired with their accepted-time groups."""
+        self._require_open()
+        run = self._registry.get_run(run_id)
+        if not is_calibrated_config(run.config):
+            raise ValueError('a calibrated window requires a calibrated run')
+        ring = self._rings.get(run_id)
+        ledger = self._calibrations.get(run_id)
+        if ring is None or ledger is None:
+            return ()
+        return tuple(
+            (CapturedFrame(ref.sequence, ring.read_page(ref.page)), ledger.group_for(ref.sequence))
+            for ref in ring.iter_slot_refs()
+        )
+
+    def retained_references(self, run_id: str) -> tuple[tuple[int, int], ...]:
+        """Reference group identifiers currently retained for one calibrated run."""
+        self._require_open()
+        run = self._registry.get_run(run_id)
+        if not is_calibrated_config(run.config):
+            raise ValueError('retained references require a calibrated run')
+        ledger = self._calibrations.get(run_id)
+        return () if ledger is None else tuple(sorted(ledger.retained_groups()))
 
     def high_water(self, run_id: str) -> int | None:
         ring = self._current_ring(run_id)
@@ -62,3 +106,4 @@ class CaptureRecorder:
         for ring in self._rings.values():
             ring.close()
         self._rings.clear()
+        self._calibrations.clear()

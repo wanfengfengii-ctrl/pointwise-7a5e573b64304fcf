@@ -1,8 +1,9 @@
 from collections.abc import Iterable
+from fractions import Fraction
 
 from station.capture.recording import CaptureRecorder, WriteReceipt
 from station.handover.tickets import HandoverTickets
-from station.quality.live import live_quality
+from station.quality.live import live_calibrated, live_quality
 from station.quality.window import WindowValues
 from station.runs.lifecycle import PausePoint
 from station.runs.registry import Run, RunRegistry
@@ -25,11 +26,22 @@ class RecordingSession:
     def open_run(self, camera_id: str, capacity: int, width: int, height: int, threshold: int) -> Run:
         return self.registry.open_run(camera_id, capacity, width, height, threshold)
 
+    def open_calibrated_run(
+        self, camera_id: str, capacity: int, width: int, height: int, threshold: int | Fraction
+    ) -> Run:
+        return self.registry.open_calibrated_run(camera_id, capacity, width, height, threshold)
+
+    def submit_reference(self, run_id: str, kind: str, reference_sequence: int, data: bytes) -> None:
+        self.capture.submit_reference(run_id, kind, reference_sequence, data)
+
     def append_frame(self, run_id: str, sequence: int, data: bytes) -> WriteReceipt:
         return self.capture.append_frame(run_id, sequence, data)
 
     def live_quality(self, run_id: str) -> WindowValues:
         return live_quality(self.registry, self.capture, run_id)
+
+    def live_calibrated(self, run_id: str) -> tuple[int, Fraction, int]:
+        return live_calibrated(self.registry, self.capture, run_id)
 
     def pause_run(self, run_id: str) -> PausePoint:
         run = self.registry.get_run(run_id)
